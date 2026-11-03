@@ -1,35 +1,55 @@
 ﻿using AcBoardSimulator.Api.Models;
-using Microsoft.Extensions.Hosting;
-using Microsoft.Extensions.Logging;
-using System;
-using System.Collections.Generic;
-using System.Linq;
-using System.Net.Http;
-using System.Net.Http.Json;
+using MQTTnet;
 using System.Text.Json;
-using System.Threading;
-using System.Threading.Tasks;
 
 namespace AcBoardSimulator.Api.Services
 {
     public class TelemetryWorker : BackgroundService
     {
         private readonly BoardStateService _boardStateService;
-        private readonly IHttpClientFactory _httpClientFactory;
         private readonly ILogger<TelemetryWorker> _logger;
+        private readonly IMqttClient _mqttClient;
         private readonly Dictionary<string, DateTime> _lastRunTimes = new();
 
-        public TelemetryWorker(BoardStateService boardStateService, IHttpClientFactory httpClientFactory, ILogger<TelemetryWorker> logger)
+        public TelemetryWorker(BoardStateService boardStateService, ILogger<TelemetryWorker> logger)
         {
             _boardStateService = boardStateService;
-            _httpClientFactory = httpClientFactory;
             _logger = logger;
+
+            // Inicializa a fábrica de clientes MQTT
+            var mqttFactory = new MqttClientFactory();
+            _mqttClient = mqttFactory.CreateMqttClient();
+        }
+
+        private async Task EnsureMqttConnectedAsync(CancellationToken token)
+        {
+            if (_mqttClient.IsConnected) return;
+
+            try
+            {
+                // Usando um Broker público gratuito para facilitar os testes dos alunos
+                var mqttOptions = new MqttClientOptionsBuilder()
+                    .WithTcpServer("broker.hivemq.com", 1883)
+                    .WithClientId($"AcSimulator_Master_{Guid.NewGuid().ToString().Substring(0, 8)}")
+                    .Build();
+
+                await _mqttClient.ConnectAsync(mqttOptions, token);
+                _logger.LogInformation("✅ Conectado ao Broker MQTT (HiveMQ) com sucesso!");
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning("⚠️ Falha ao conectar no Broker MQTT: {Message}", ex.Message);
+            }
         }
 
         protected override async Task ExecuteAsync(CancellationToken stoppingToken)
         {
+            _logger.LogInformation("🚀 Worker MQTT Multiplexador iniciado.");
+
             while (!stoppingToken.IsCancellationRequested)
             {
+                await EnsureMqttConnectedAsync(stoppingToken);
+
                 var boardIds = _boardStateService.GetAllBoardIds();
                 var now = DateTime.UtcNow;
                 var dispatchTasks = new List<Task>();
@@ -38,7 +58,8 @@ namespace AcBoardSimulator.Api.Services
                 {
                     var config = _boardStateService.GetConfig(deviceId);
 
-                    if (!config.IsTransmissionActive || string.IsNullOrWhiteSpace(config.TargetApiUrl)) continue;
+                    // Só envia se o botão "Iniciar Envio" estiver verde na tela Vue
+                    if (!config.IsTransmissionActive) continue;
 
                     if (!_lastRunTimes.TryGetValue(deviceId, out var lastRun)) { lastRun = now; _lastRunTimes[deviceId] = now; }
 
@@ -48,31 +69,48 @@ namespace AcBoardSimulator.Api.Services
                     {
                         _lastRunTimes[deviceId] = now;
                         int elapsedSeconds = Math.Max(1, (int)(elapsedMs / 1000));
-                        dispatchTasks.Add(DispatchTelemetryAsync(deviceId, config, elapsedSeconds, stoppingToken));
+
+                        // Dispara a publicação da mensagem em paralelo
+                        dispatchTasks.Add(PublishTelemetryAsync(deviceId, config, elapsedSeconds, stoppingToken));
                     }
                 }
 
                 if (dispatchTasks.Any()) await Task.WhenAll(dispatchTasks);
 
-                await Task.Delay(500, stoppingToken); // Respira 500ms e varre as placas novamente
+                await Task.Delay(500, stoppingToken); // Respira meio segundo
             }
+
+            // Desconecta graciosamente quando a API for desligada
+            if (_mqttClient.IsConnected)
+                await _mqttClient.DisconnectAsync(new MqttClientDisconnectOptionsBuilder().Build(), CancellationToken.None);
         }
 
-        private async Task DispatchTelemetryAsync(string deviceId, SimulatorConfig config, int elapsedSeconds, CancellationToken token)
+        private async Task PublishTelemetryAsync(string deviceId, SimulatorConfig config, int elapsedSeconds, CancellationToken token)
         {
             var payload = _boardStateService.GenerateNextTelemetryPacket(deviceId, elapsedSeconds);
             try
             {
-                using var client = _httpClientFactory.CreateClient("MaintenanceApiClient");
-                using var request = new HttpRequestMessage(HttpMethod.Post, config.TargetApiUrl);
-                request.Content = JsonContent.Create(payload, options: new JsonSerializerOptions { PropertyNamingPolicy = JsonNamingPolicy.CamelCase });
+                if (!_mqttClient.IsConnected) return;
 
-                using var response = await client.SendAsync(request, token);
-                _boardStateService.RecordDispatchResult(deviceId, (int)response.StatusCode, response.IsSuccessStatusCode ? "OK" : $"Erro {(int)response.StatusCode}");
+                // Transforma os dados em JSON (CamelCase)
+                string jsonString = JsonSerializer.Serialize(payload, new JsonSerializerOptions { PropertyNamingPolicy = JsonNamingPolicy.CamelCase });
+
+                // Monta o "Pacote/Envelope" do MQTT
+                var applicationMessage = new MqttApplicationMessageBuilder()
+                    .WithTopic($"telemetria/venther/{deviceId}") // O tópico onde os alunos devem se inscrever
+                    .WithPayload(jsonString)
+                    .WithQualityOfServiceLevel(MQTTnet.Protocol.MqttQualityOfServiceLevel.AtMostOnce) // QoS 0
+                    .Build();
+
+                // Entrega no Broker (Correio)
+                await _mqttClient.PublishAsync(applicationMessage, token);
+
+                // Grava status 200 pro Vue.js mostrar que publicou com sucesso
+                _boardStateService.RecordDispatchResult(deviceId, 200, "Publicado (MQTT)");
             }
             catch (Exception ex)
             {
-                _boardStateService.RecordDispatchResult(deviceId, null, "Falha de Conexão");
+                _boardStateService.RecordDispatchResult(deviceId, null, "Falha MQTT");
             }
         }
     }
