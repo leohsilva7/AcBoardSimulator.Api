@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
@@ -50,6 +50,29 @@ namespace AcBoardSimulator.Api.Services
         {
             var instance = GetInstance(deviceId);
             lock (instance.InstanceLock) { return ClonePayload(instance.State); }
+        }
+
+        public DeviceStateDto GetDeviceState(string deviceId)
+        {
+            var instance = GetInstance(deviceId);
+            lock (instance.InstanceLock)
+            {
+                var state = instance.State;
+                bool applyJitter = instance.Config.ApplySensorJitter && state.OperationalState.PowerState;
+
+                return new DeviceStateDto
+                {
+                    DeviceId = state.Metadata.DeviceId,
+                    SupplyAirTemperature = CalculateSupplyAirTemperature(state, applyJitter),
+                    ReturnAirTemperature = state.Temperatures.IndoorReturnAirC,
+                    CondensationAirTemperature = state.Temperatures.CondenserCoilC,
+                    OutdoorTemperature = state.Temperatures.OutdoorAmbientC,
+                    GasLinePressure = state.RefrigerationCycle.SuctionPressurePsi,
+                    LiquidLinePressure = state.RefrigerationCycle.DischargePressurePsi,
+                    EvaporatorCoilPressureDrop = CalculateEvaporatorPressureDrop(state, applyJitter),
+                    CondenserCoilPressureDrop = CalculateCondenserPressureDrop(state, applyJitter)
+                };
+            }
         }
 
         public void UpdateState(string deviceId, AcTelemetryPayload newState)
@@ -171,6 +194,85 @@ namespace AcBoardSimulator.Api.Services
 
         private double Lerp(double current, double target, double rate) => Math.Round(current + (target - current) * rate, 2);
         private double AddJitter(double baseValue, double maxVariance) => Math.Round(baseValue + ((_random.NextDouble() * 2.0 - 1.0) * maxVariance), 2);
+
+        private double NextGaussian(double mean, double stdDev)
+        {
+            double u1 = 1.0 - _random.NextDouble();
+            double u2 = 1.0 - _random.NextDouble();
+            double randStdNormal = Math.Sqrt(-2.0 * Math.Log(u1)) * Math.Sin(2.0 * Math.PI * u2);
+            return mean + stdDev * randStdNormal;
+        }
+
+        private double CalculateSupplyAirTemperature(AcTelemetryPayload state, bool applyJitter)
+        {
+            if (!state.OperationalState.PowerState || state.Actuators.IndoorFanRpm <= 0)
+            {
+                return Math.Round(state.Temperatures.IndoorReturnAirC, 2);
+            }
+
+            double tRet = state.Temperatures.IndoorReturnAirC;
+            double pSuc = state.RefrigerationCycle.SuctionPressurePsi;
+            const double tSup0 = 13.0;
+            const double tRet0 = 24.0;
+            const double pSuc0 = 120.0;
+
+            double tSup = tSup0 + 0.2 * (tRet - tRet0) + 0.18 * (pSuc - pSuc0);
+            double maxAllowed = Math.Max(5.0, tRet - 4.0);
+            tSup = Math.Clamp(tSup, 5.0, maxAllowed);
+
+            if (applyJitter)
+            {
+                tSup += NextGaussian(0.0, 0.2);
+                tSup = Math.Clamp(tSup, 5.0, maxAllowed);
+            }
+
+            return Math.Round(tSup, 2);
+        }
+
+        private double CalculateEvaporatorPressureDrop(AcTelemetryPayload state, bool applyJitter)
+        {
+            int rpm = state.Actuators.IndoorFanRpm;
+            if (!state.OperationalState.PowerState || rpm <= 0)
+            {
+                return 0.0;
+            }
+
+            const double deltaPe0 = 120.0;
+            double phiE = state.Diagnostics.AirFilterDirty ? 0.25 : 0.0;
+            double w = (state.OperationalState.PowerState && state.Actuators.CompressorFrequencyHz > 0) ? 1.0 : 0.0;
+            double fanRatio = rpm / 1050.0;
+
+            double deltaPe = deltaPe0 * (1.0 + phiE) * (1.0 + 0.15 * w) * (fanRatio * fanRatio);
+
+            if (applyJitter)
+            {
+                deltaPe += NextGaussian(0.0, deltaPe * 0.02);
+            }
+
+            return Math.Round(Math.Max(0.0, deltaPe), 2);
+        }
+
+        private double CalculateCondenserPressureDrop(AcTelemetryPayload state, bool applyJitter)
+        {
+            int rpm = state.Actuators.OutdoorFanRpm;
+            if (!state.OperationalState.PowerState || rpm <= 0)
+            {
+                return 0.0;
+            }
+
+            const double deltaPc0 = 30.0;
+            const double phiC = 0.0;
+            double fanRatio = rpm / 720.0;
+
+            double deltaPc = deltaPc0 * (1.0 + phiC) * (fanRatio * fanRatio);
+
+            if (applyJitter)
+            {
+                deltaPc += NextGaussian(0.0, deltaPc * 0.03);
+            }
+
+            return Math.Round(Math.Max(0.0, deltaPc), 2);
+        }
 
         private static AcTelemetryPayload ClonePayload(AcTelemetryPayload source) =>
             System.Text.Json.JsonSerializer.Deserialize<AcTelemetryPayload>(System.Text.Json.JsonSerializer.Serialize(source));

@@ -1,4 +1,4 @@
-﻿using AcBoardSimulator.Api.Models;
+using AcBoardSimulator.Api.Models;
 using MQTTnet;
 using System.Text.Json;
 
@@ -29,8 +29,10 @@ namespace AcBoardSimulator.Api.Services
             {
                 // Usando um Broker público gratuito para facilitar os testes dos alunos
                 var mqttOptions = new MqttClientOptionsBuilder()
-                    .WithTcpServer("broker.hivemq.com", 1883)
-                    .WithClientId($"AcSimulator_Master_{Guid.NewGuid().ToString().Substring(0, 8)}")
+                    .WithTcpServer("d895a66657a84666a1d0f741b27e2be8.s1.eu.hivemq.cloud", 8883)
+                    .WithClientId($"TestEndpointSSL_{Guid.NewGuid().ToString()[..8]}")
+                    .WithCredentials("mario", "senai123")
+                    .WithTlsOptions(new MqttClientTlsOptionsBuilder().UseTls().Build())
                     .Build();
 
                 await _mqttClient.ConnectAsync(mqttOptions, token);
@@ -87,13 +89,14 @@ namespace AcBoardSimulator.Api.Services
 
         private async Task PublishTelemetryAsync(string deviceId, SimulatorConfig config, int elapsedSeconds, CancellationToken token)
         {
-            var payload = _boardStateService.GenerateNextTelemetryPacket(deviceId, elapsedSeconds);
+            _boardStateService.GenerateNextTelemetryPacket(deviceId, elapsedSeconds);
+            var stateDto = _boardStateService.GetDeviceState(deviceId);
             try
             {
                 if (!_mqttClient.IsConnected) return;
 
-                // Transforma os dados em JSON (CamelCase)
-                string jsonString = JsonSerializer.Serialize(payload, new JsonSerializerOptions { PropertyNamingPolicy = JsonNamingPolicy.CamelCase });
+                // Transforma os dados em JSON (9 campos em snake_case / deviceId)
+                string jsonString = JsonSerializer.Serialize(stateDto);
 
                 // Monta o "Pacote/Envelope" do MQTT
                 var applicationMessage = new MqttApplicationMessageBuilder()

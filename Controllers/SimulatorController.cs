@@ -1,4 +1,4 @@
-﻿using System.Collections.Generic;
+using System.Collections.Generic;
 using AcBoardSimulator.Api.Models;
 using AcBoardSimulator.Api.Services;
 using Microsoft.AspNetCore.Mvc;
@@ -27,9 +27,9 @@ namespace AcBoardSimulator.Api.Controllers
         }
 
         [HttpGet("{deviceId}/state")]
-        public ActionResult<AcTelemetryPayload> GetState(string deviceId)
+        public ActionResult<DeviceStateDto> GetState(string deviceId)
         {
-            try { return Ok(_boardStateService.GetRawState(deviceId)); }
+            try { return Ok(_boardStateService.GetDeviceState(deviceId)); }
             catch (KeyNotFoundException) { return NotFound(); }
         }
 
