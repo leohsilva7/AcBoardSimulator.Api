@@ -283,8 +283,7 @@ namespace AcBoardSimulator.Api.Services
 
             double deltaPe = deltaPe0 * (1.0 + phiE) * (1.0 + 0.15 * w) * (fanRatio * fanRatio);
 
-            if (applyJitter)
-            {
+            if (applyJitter) {
                 deltaPe += NextGaussian(0.0, deltaPe * 0.02);
             }
 
