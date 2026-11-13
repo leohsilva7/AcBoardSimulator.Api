@@ -2,7 +2,13 @@ using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
+using AcBoardSimulator.Api.Data;
 using AcBoardSimulator.Api.Models;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Caching.Memory;
+using Microsoft.Extensions.DependencyInjection;
 
 namespace AcBoardSimulator.Api.Services
 {
@@ -18,23 +24,56 @@ namespace AcBoardSimulator.Api.Services
 
         private readonly ConcurrentDictionary<string, BoardInstance> _boards = new();
         private readonly Random _random = new();
+        private readonly IServiceScopeFactory _scopeFactory;
+        private readonly IMemoryCache _cache;
+        private const string BoardIdsCacheKey = "BoardIds_Active";
+        private static readonly TimeSpan CacheDuration = TimeSpan.FromSeconds(30);
 
-        public BoardStateService()
+        public BoardStateService(IServiceScopeFactory scopeFactory, IMemoryCache cache)
         {
-            // Cria uma placa padrão ao iniciar para o Frontend já ter algo para carregar
-            CreateOrResetBoard("AC-INV-MARILIA-001");
-            CreateOrResetBoard("AC-INV-SALA-002"); // Exemplo de uma segunda placa
+            _scopeFactory = scopeFactory;
+            _cache = cache;
         }
 
-        public List<string> GetAllBoardIds() => _boards.Keys.ToList();
-
-        public void CreateOrResetBoard(string deviceId)
+        public async Task<List<string>> GetAllBoardIdsAsync(CancellationToken cancellationToken = default)
         {
-            var newInstance = new BoardInstance();
-            newInstance.State.Metadata.DeviceId = deviceId;
-            newInstance.Config.TargetApiUrl = "https://localhost:7100/api/telemetry"; // Sua URL destino padrão
+            var cachedIds = await _cache.GetOrCreateAsync(BoardIdsCacheKey, async entry =>
+            {
+                entry.AbsoluteExpirationRelativeToNow = CacheDuration;
 
-            _boards.AddOrUpdate(deviceId, newInstance, (key, existing) => newInstance);
+                using var scope = _scopeFactory.CreateScope();
+                var dbContext = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+
+                var boardGuids = await dbContext.Boards
+                    .AsNoTracking()
+                    .Where(b => b.DeletedAt == null)
+                    .Select(b => b.Id)
+                    .ToListAsync(cancellationToken);
+
+                return boardGuids.Select(id => id.ToString()).ToList();
+            });
+
+            var result = cachedIds ?? new List<string>();
+
+            foreach (var id in result)
+            {
+                EnsureBoardInstance(id);
+            }
+
+            return result;
+        }
+
+        public List<string> GetAllBoardIds() => GetAllBoardIdsAsync().GetAwaiter().GetResult();
+
+        private BoardInstance EnsureBoardInstance(string deviceId)
+        {
+            return _boards.GetOrAdd(deviceId, id =>
+            {
+                var newInstance = new BoardInstance();
+                newInstance.State.Metadata.DeviceId = id;
+                newInstance.Config.TargetApiUrl = "https://localhost:7100/api/telemetry"; // Sua URL destino padrão
+                return newInstance;
+            });
         }
 
         public bool RemoveBoard(string deviceId) => _boards.TryRemove(deviceId, out _);

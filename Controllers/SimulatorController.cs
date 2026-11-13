@@ -17,14 +17,7 @@ namespace AcBoardSimulator.Api.Controllers
         }
 
         [HttpGet("devices")]
-        public ActionResult<List<string>> GetAllDevices() => Ok(_boardStateService.GetAllBoardIds());
-
-        [HttpPost("devices/{deviceId}")]
-        public ActionResult CreateDevice(string deviceId)
-        {
-            _boardStateService.CreateOrResetBoard(deviceId);
-            return Ok(new { message = $"Dispositivo {deviceId} criado." });
-        }
+        public async Task<ActionResult<List<string>>> GetAllDevices() => Ok(await _boardStateService.GetAllBoardIdsAsync());
 
         [HttpGet("{deviceId}/state")]
         public ActionResult<DeviceStateDto> GetState(string deviceId)

@@ -29,9 +29,9 @@ namespace AcBoardSimulator.Api.Services
             {
                 // Usando um Broker público gratuito para facilitar os testes dos alunos
                 var mqttOptions = new MqttClientOptionsBuilder()
-                    .WithTcpServer("asdf", 8883)
+                    .WithTcpServer("d895a66657a84666a1d0f741b27e2be8.s1.eu.hivemq.cloud", 8883)
                     .WithClientId($"TestEndpointSSL_{Guid.NewGuid().ToString()[..8]}")
-                    .WithCredentials("sadf", "asdf")
+                    .WithCredentials("mario", "senai123")
                     .WithTlsOptions(new MqttClientTlsOptionsBuilder().UseTls().Build())
                     .Build();
 
@@ -52,7 +52,7 @@ namespace AcBoardSimulator.Api.Services
             {
                 await EnsureMqttConnectedAsync(stoppingToken);
 
-                var boardIds = _boardStateService.GetAllBoardIds();
+                var boardIds = await _boardStateService.GetAllBoardIdsAsync(stoppingToken);
                 var now = DateTime.UtcNow;
                 var dispatchTasks = new List<Task>();
 
