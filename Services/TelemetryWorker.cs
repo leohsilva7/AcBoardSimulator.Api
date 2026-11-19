@@ -113,6 +113,7 @@ namespace AcBoardSimulator.Api.Services
             }
             catch (Exception ex)
             {
+                _logger.LogWarning("⚠️ Falha ao publicar telemetria para o dispositivo {DeviceId}: {Message}", deviceId, ex.Message);
                 _boardStateService.RecordDispatchResult(deviceId, null, "Falha MQTT");
             }
         }

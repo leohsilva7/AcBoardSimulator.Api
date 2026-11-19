@@ -30,6 +30,9 @@ namespace AcBoardSimulator.Api.Models
 
         [JsonPropertyName("condenser_coil_pressure_drop")]
         public double CondenserCoilPressureDrop { get; set; }
+
+        [JsonPropertyName("failure")]
+        [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+        public DeviceFailureDto? Failure { get; set; }
     }
 }
-

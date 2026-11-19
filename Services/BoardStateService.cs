@@ -22,17 +22,19 @@ namespace AcBoardSimulator.Api.Services
             public readonly object InstanceLock = new();
         }
 
-        private readonly ConcurrentDictionary<string, BoardInstance> _boards = new();
+        private readonly ConcurrentDictionary<string, BoardInstance> _boards = new(StringComparer.OrdinalIgnoreCase);
         private readonly Random _random = new();
         private readonly IServiceScopeFactory _scopeFactory;
         private readonly IMemoryCache _cache;
+        private readonly IFailureDetectionService _failureDetectionService;
         private const string BoardIdsCacheKey = "BoardIds_Active";
         private static readonly TimeSpan CacheDuration = TimeSpan.FromSeconds(30);
 
-        public BoardStateService(IServiceScopeFactory scopeFactory, IMemoryCache cache)
+        public BoardStateService(IServiceScopeFactory scopeFactory, IMemoryCache cache, IFailureDetectionService failureDetectionService)
         {
             _scopeFactory = scopeFactory;
             _cache = cache;
+            _failureDetectionService = failureDetectionService;
         }
 
         public async Task<List<string>> GetAllBoardIdsAsync(CancellationToken cancellationToken = default)
@@ -80,9 +82,25 @@ namespace AcBoardSimulator.Api.Services
 
         private BoardInstance GetInstance(string deviceId)
         {
-            if (!_boards.TryGetValue(deviceId, out var instance))
-                throw new KeyNotFoundException($"Placa {deviceId} não encontrada.");
-            return instance;
+            if (_boards.TryGetValue(deviceId, out var instance))
+            {
+                return instance;
+            }
+
+            // Se ainda não estava em memória, verifica no banco de dados e cria a instância
+            if (Guid.TryParse(deviceId, out var guid))
+            {
+                using var scope = _scopeFactory.CreateScope();
+                var dbContext = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+                bool exists = dbContext.Boards.Any(b => b.Id == guid && b.DeletedAt == null);
+
+                if (exists)
+                {
+                    return EnsureBoardInstance(deviceId);
+                }
+            }
+
+            throw new KeyNotFoundException($"Placa {deviceId} não encontrada.");
         }
 
         public AcTelemetryPayload GetRawState(string deviceId)
@@ -99,7 +117,7 @@ namespace AcBoardSimulator.Api.Services
                 var state = instance.State;
                 bool applyJitter = instance.Config.ApplySensorJitter && state.OperationalState.PowerState;
 
-                return new DeviceStateDto
+                var dto = new DeviceStateDto
                 {
                     DeviceId = state.Metadata.DeviceId,
                     SupplyAirTemperature = CalculateSupplyAirTemperature(state, applyJitter),
@@ -111,6 +129,9 @@ namespace AcBoardSimulator.Api.Services
                     EvaporatorCoilPressureDrop = CalculateEvaporatorPressureDrop(state, applyJitter),
                     CondenserCoilPressureDrop = CalculateCondenserPressureDrop(state, applyJitter)
                 };
+
+                dto.Failure = _failureDetectionService.EvaluateFailure(dto, state);
+                return dto;
             }
         }
 
@@ -195,6 +216,26 @@ namespace AcBoardSimulator.Api.Services
                 return;
             }
 
+            // Preserva condições ativas de falhas simuladas
+            if (state.Diagnostics.ErrorCode == "EC") // Falta de gás / vazamento
+            {
+                state.RefrigerationCycle.SuctionPressurePsi = Lerp(state.RefrigerationCycle.SuctionPressurePsi, 42.0, 0.05);
+                state.RefrigerationCycle.DischargePressurePsi = Lerp(state.RefrigerationCycle.DischargePressurePsi, 230.0, 0.05);
+                return;
+            }
+            if (state.Diagnostics.ErrorCode == "P0") // Falha mecânica do compressor
+            {
+                const double equalized = 150.0;
+                state.RefrigerationCycle.SuctionPressurePsi = Lerp(state.RefrigerationCycle.SuctionPressurePsi, equalized, 0.05);
+                state.RefrigerationCycle.DischargePressurePsi = Lerp(state.RefrigerationCycle.DischargePressurePsi, equalized, 0.05);
+                return;
+            }
+            if (state.Diagnostics.ErrorCode == "E1") // Pressostato de alta acionado
+            {
+                state.RefrigerationCycle.DischargePressurePsi = Lerp(state.RefrigerationCycle.DischargePressurePsi, 615.0, 0.05);
+                return;
+            }
+
             double hz = state.Actuators.CompressorFrequencyHz;
             double eev = state.RefrigerationCycle.EevOpeningSteps;
 
@@ -214,18 +255,95 @@ namespace AcBoardSimulator.Api.Services
             var instance = GetInstance(deviceId);
             lock (instance.InstanceLock)
             {
-                if (presetName == "NORMAL")
+                var upperPreset = presetName?.ToUpperInvariant();
+                switch (upperPreset)
                 {
-                    instance.State.Diagnostics.ErrorCode = "NONE";
-                    instance.State.RefrigerationCycle.SuctionPressurePsi = 125;
+                    case "NORMAL":
+                        instance.State.Diagnostics.ErrorCode = "NONE";
+                        instance.State.Diagnostics.ErrorDescription = "Operação normal";
+                        instance.State.Diagnostics.ProtectionTripped = false;
+                        instance.State.Diagnostics.AirFilterDirty = false;
+                        instance.State.RefrigerationCycle.SuctionPressurePsi = 125.0;
+                        instance.State.RefrigerationCycle.DischargePressurePsi = 368.0;
+                        instance.State.RefrigerationCycle.EevOpeningSteps = 240;
+                        instance.State.Electrical.AcInputVoltageV = 220.0;
+                        instance.State.Electrical.TotalCurrentA = 5.85;
+                        instance.State.Actuators.IndoorFanRpm = 1050;
+                        instance.State.Actuators.OutdoorFanRpm = 720;
+                        instance.State.Actuators.CompressorFrequencyHz = 58.0;
+                        instance.State.Temperatures.IndoorReturnAirC = 23.4;
+                        instance.State.Temperatures.OutdoorAmbientC = 32.5;
+                        instance.State.Temperatures.CondenserCoilC = 44.8;
+                        break;
+
+                    case "GAS_LEAK":
+                        instance.State.Diagnostics.ErrorCode = "EC";
+                        instance.State.Diagnostics.ErrorDescription = "Falta de gás refrigerante";
+                        instance.State.RefrigerationCycle.SuctionPressurePsi = 42.0;
+                        instance.State.RefrigerationCycle.DischargePressurePsi = 230.0;
+                        instance.State.RefrigerationCycle.EevOpeningSteps = 480;
+                        break;
+
+                    case "HIGH_PRESSURE":
+                        instance.State.Diagnostics.ErrorCode = "E1";
+                        instance.State.Diagnostics.ErrorDescription = "Sobrecarga de alta pressão";
+                        instance.State.Diagnostics.ProtectionTripped = true;
+                        instance.State.RefrigerationCycle.DischargePressurePsi = 615.0;
+                        instance.State.Temperatures.CondenserCoilC = 68.0;
+                        break;
+
+                    case "DIRTY_FILTER":
+                        instance.State.Diagnostics.ErrorCode = "CL";
+                        instance.State.Diagnostics.ErrorDescription = "Filtro de ar muito sujo / obstruído";
+                        instance.State.Diagnostics.AirFilterDirty = true;
+                        instance.State.Actuators.IndoorFanRpm = 650;
+                        instance.State.RefrigerationCycle.SuctionPressurePsi = 105.0;
+                        break;
+
+                    case "DIRTY_CONDENSER":
+                        instance.State.Diagnostics.ErrorCode = "E3";
+                        instance.State.Diagnostics.ErrorDescription = "Condensadora obstruída ou ventilador fraco";
+                        instance.State.RefrigerationCycle.DischargePressurePsi = 520.0;
+                        instance.State.Temperatures.CondenserCoilC = 62.0;
+                        instance.State.Actuators.OutdoorFanRpm = 450;
+                        break;
+
+                    case "FREEZING":
+                        instance.State.Diagnostics.ErrorCode = "E2";
+                        instance.State.Diagnostics.ErrorDescription = "Risco de congelamento da serpentina";
+                        instance.State.RefrigerationCycle.SuctionPressurePsi = 85.0;
+                        instance.State.Actuators.IndoorFanRpm = 500;
+                        break;
+
+                    case "COMPRESSOR_FAIL":
+                        instance.State.Diagnostics.ErrorCode = "P0";
+                        instance.State.Diagnostics.ErrorDescription = "Falha mecânica do compressor (sem compressão)";
+                        instance.State.RefrigerationCycle.SuctionPressurePsi = 150.0;
+                        instance.State.RefrigerationCycle.DischargePressurePsi = 150.0;
+                        instance.State.Actuators.CompressorFrequencyHz = 50.0;
+                        break;
+
+                    case "UNDER_VOLTAGE":
+                        instance.State.Diagnostics.ErrorCode = "P1";
+                        instance.State.Diagnostics.ErrorDescription = "Subtensão crítica na rede elétrica";
+                        instance.State.Electrical.AcInputVoltageV = 160.0;
+                        instance.State.Electrical.TotalCurrentA = 1.0;
+                        break;
+
+                    case "POWER_OUTAGE":
+                    case "NO_VOLTAGE":
+                        instance.State.Diagnostics.ErrorCode = "P1";
+                        instance.State.Diagnostics.ErrorDescription = "Falta de tensão elétrica";
+                        instance.State.Electrical.AcInputVoltageV = 0.0;
+                        instance.State.Electrical.TotalCurrentA = 0.0;
+                        break;
+
+                    case "OUTDOOR_EXTREME":
+                        instance.State.Diagnostics.ErrorCode = "T1";
+                        instance.State.Diagnostics.ErrorDescription = "Temperatura ambiente externa extrema";
+                        instance.State.Temperatures.OutdoorAmbientC = 53.0;
+                        break;
                 }
-                else if (presetName == "GAS_LEAK")
-                {
-                    instance.State.Diagnostics.ErrorCode = "EC";
-                    instance.State.RefrigerationCycle.SuctionPressurePsi = 48;
-                    instance.State.RefrigerationCycle.EevOpeningSteps = 480;
-                }
-                // Adicione os outros presets aqui seguindo a lógica do código antigo
 
                 return ClonePayload(instance.State);
             }
@@ -276,8 +394,11 @@ namespace AcBoardSimulator.Api.Services
                 return 0.0;
             }
 
-            const double deltaPe0 = 120.0;
-            double phiE = state.Diagnostics.AirFilterDirty ? 0.25 : 0.0;
+            // Faixa normal limpa: 25 a 62 Pa (típico ~45 Pa).
+            // Filtro ou serpentina muito suja (falha): >= 100 Pa (típico ~110-120 Pa).
+            const double deltaPe0 = 45.0;
+            bool isDirty = state.Diagnostics.AirFilterDirty || state.Diagnostics.ErrorCode == "CL";
+            double phiE = isDirty ? 1.5 : 0.0;
             double w = (state.OperationalState.PowerState && state.Actuators.CompressorFrequencyHz > 0) ? 1.0 : 0.0;
             double fanRatio = rpm / 1050.0;
 
@@ -298,8 +419,10 @@ namespace AcBoardSimulator.Api.Services
                 return 0.0;
             }
 
+            // Faixa normal limpa: ~30 Pa.
+            // Condensadora com bloqueio / sujeira (falha >= +30% a 45 Pa):
             const double deltaPc0 = 30.0;
-            const double phiC = 0.0;
+            double phiC = (state.Diagnostics.ErrorCode == "E3") ? 0.50 : 0.0;
             double fanRatio = rpm / 720.0;
 
             double deltaPc = deltaPc0 * (1.0 + phiC) * (fanRatio * fanRatio);
@@ -313,9 +436,9 @@ namespace AcBoardSimulator.Api.Services
         }
 
         private static AcTelemetryPayload ClonePayload(AcTelemetryPayload source) =>
-            System.Text.Json.JsonSerializer.Deserialize<AcTelemetryPayload>(System.Text.Json.JsonSerializer.Serialize(source));
+            System.Text.Json.JsonSerializer.Deserialize<AcTelemetryPayload>(System.Text.Json.JsonSerializer.Serialize(source)) ?? new AcTelemetryPayload();
 
         private static SimulatorConfig CloneConfig(SimulatorConfig source) =>
-            System.Text.Json.JsonSerializer.Deserialize<SimulatorConfig>(System.Text.Json.JsonSerializer.Serialize(source));
+            System.Text.Json.JsonSerializer.Deserialize<SimulatorConfig>(System.Text.Json.JsonSerializer.Serialize(source)) ?? new SimulatorConfig();
     }
 }

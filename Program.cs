@@ -30,6 +30,7 @@ builder.Services.AddHttpClient("MaintenanceApiClient", client =>
     client.Timeout = TimeSpan.FromSeconds(10);
 });
 
+builder.Services.AddSingleton<IFailureDetectionService, FailureDetectionService>();
 builder.Services.AddSingleton<BoardStateService>();
 builder.Services.AddHostedService<TelemetryWorker>();
 
